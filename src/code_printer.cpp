@@ -309,7 +309,7 @@ void CodePrinter::printStmt(const StmtPtr& s, int indent, std::string& out)
     {
         if (s->targets.size() == 1 && s->values.size() == 1 && s->values[0]->kind == EK::Function)
         {
-            out << ind; // placeholder to keep structure; replaced below
+            out += ind; // placeholder to keep structure; replaced below
         }
         if (s->targets.size() == 1 && s->values.size() == 1 && s->values[0]->kind == EK::Function)
         {

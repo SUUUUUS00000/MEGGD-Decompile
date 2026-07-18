@@ -7,6 +7,7 @@
 #include "httplib.h"
 #include "decompiler.hpp"
 #include "bytecode_types.hpp"
+#include "bytecode_reader.hpp"
 
 #include <iostream>
 #include <string>
@@ -102,7 +103,8 @@ int main()
                 return;
             }
 
-            std::string decompiled_code = luaudec::decompile_bytecode(data, size);
+            luaudec::Module module = luaudec::BytecodeReader::read(data, size);
+            std::string decompiled_code = luaudec::decompileModule(module);
 
             res.status = 200;
             res.set_content(decompiled_code, "text/plain");

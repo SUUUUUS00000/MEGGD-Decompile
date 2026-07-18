@@ -11,6 +11,31 @@
 #include <iostream>
 #include <string>
 #include <cstdlib>
+#include <vector>
+
+// Helper to decode Base64 payload safely.
+std::string base64_decode(const std::string& in)
+{
+    std::string out;
+    std::vector<int> T(256, -1);
+    for (int i = 0; i < 64; i++) 
+        T[static_cast<unsigned char>("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"[i])] = i;
+
+    int val = 0, valb = -8;
+    for (unsigned char c : in)
+    {
+        if (T[c] == -1) 
+            continue;
+        val = (val << 6) + T[c];
+        valb += 6;
+        if (valb >= 0)
+        {
+            out.push_back(char((val >> valb) & 0xFF));
+            valb -= 8;
+        }
+    }
+    return out;
+}
 
 int main()
 {
@@ -22,8 +47,17 @@ int main()
 
         try
         {
-            const uint8_t* data = reinterpret_cast<const uint8_t*>(req.body.data());
-            size_t size = req.body.size();
+            std::string raw_data = req.body;
+
+            // If the payload does not start with a valid Luau version byte (3..12),
+            // but looks like a Base64 string, we decode it first to bypass exploit null-byte truncation.
+            if (!raw_data.empty() && (raw_data[0] < 3 || raw_data[0] > 12))
+            {
+                raw_data = base64_decode(req.body);
+            }
+
+            const uint8_t* data = reinterpret_cast<const uint8_t*>(raw_data.data());
+            size_t size = raw_data.size();
 
             if (size == 0)
             {

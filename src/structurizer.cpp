@@ -4,6 +4,7 @@
 
 #include <unordered_map>
 #include <optional>
+#include <set>
 
 namespace luaudec
 {
@@ -69,6 +70,87 @@ std::vector<uint8_t> conditionOperandRegs(const Instruction& insn)
     default:
         return {};
     }
+}
+
+// True for opcodes whose `.a` field is a write destination (the set that
+// ExprTracker::step()/produceValue handle as value-producing). Used to
+// detect loop-carried variables: a register written inside a loop body
+// that already held a value from before the loop needs pinning even when
+// it's not a condition operand (e.g. an accumulator like `sum = sum + i`).
+bool writesRegisterA(Op op)
+{
+    switch (op)
+    {
+    case Op::LOADNIL:
+    case Op::LOADB:
+    case Op::LOADN:
+    case Op::LOADK:
+    case Op::LOADKX:
+    case Op::GETUPVAL:
+    case Op::GETIMPORT:
+    case Op::MOVE:
+    case Op::GETGLOBAL:
+    case Op::GETTABLE:
+    case Op::GETTABLEN:
+    case Op::GETTABLEKS:
+    case Op::GETUDATAKS:
+    case Op::ADD:
+    case Op::SUB:
+    case Op::MUL:
+    case Op::DIV:
+    case Op::MOD:
+    case Op::POW:
+    case Op::IDIV:
+    case Op::ADDK:
+    case Op::SUBK:
+    case Op::MULK:
+    case Op::DIVK:
+    case Op::MODK:
+    case Op::POWK:
+    case Op::IDIVK:
+    case Op::AND:
+    case Op::OR:
+    case Op::ANDK:
+    case Op::ORK:
+    case Op::SUBRK:
+    case Op::DIVRK:
+    case Op::CONCAT:
+    case Op::NOT:
+    case Op::MINUS:
+    case Op::LENGTH:
+    case Op::NEWTABLE:
+    case Op::DUPTABLE:
+    case Op::NEWCLOSURE:
+    case Op::DUPCLOSURE:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// Registers written by any instruction in [lo, hi).
+std::set<uint8_t> collectWrittenRegs(const Proto& proto, int lo, int hi)
+{
+    std::set<uint8_t> out;
+    for (int i = lo; i < hi && i < static_cast<int>(proto.instructions.size()); ++i)
+    {
+        const Instruction& insn = proto.instructions[i];
+        if (writesRegisterA(insn.op))
+            out.insert(insn.a);
+        else if (insn.op == Op::CALL && insn.c >= 2)
+        {
+            uint32_t n = insn.c - 1;
+            for (uint32_t k = 0; k < n; ++k)
+                out.insert(static_cast<uint8_t>(insn.a + k));
+        }
+        else if (insn.op == Op::GETVARARGS && insn.b >= 2)
+        {
+            uint32_t n = insn.b - 1;
+            for (uint32_t k = 0; k < n; ++k)
+                out.insert(static_cast<uint8_t>(insn.a + k));
+        }
+    }
+    return out;
 }
 
 } // namespace
@@ -199,17 +281,41 @@ private:
     // pre-branch value (if never consumed) or leak a raw register
     // placeholder (if a compound value got consumed here and the branch
     // tries to read it again).
-    void pinConditionRegs(const Instruction& condInsn, uint32_t fromPc, uint32_t untilPc, std::vector<StmtPtr>& result, bool pinAtomsToo)
+    std::set<uint8_t> pinConditionRegs(const Instruction& condInsn, uint32_t fromPc, uint32_t untilPc, std::vector<StmtPtr>& result, bool pinAtomsToo)
     {
+        std::set<uint8_t> pinned;
         for (uint8_t reg : conditionOperandRegs(condInsn))
         {
             if (!pinAtomsToo && !tracker_.isCompoundPending(reg))
                 continue; // safe to leave as a freely re-readable atom (e.g. a literal constant)
             std::string name = tracker_.localNameAt(reg, fromPc).value_or(tracker_.freshSyntheticName());
             tracker_.pinAsVariable(reg, fromPc, untilPc, name);
+            pinned.insert(reg);
         }
         for (StmtPtr& s : tracker_.takeStmts())
             result.push_back(std::move(s));
+        return pinned;
+    }
+
+    // Pins registers that are written *inside* a loop body [bodyLo,
+    // bodyHi) and *also* already hold a value from before the loop (an
+    // accumulator pattern: `sum = 0` before, `sum = sum + i` inside). Not
+    // limited to condition operands -- this covers loop-body variables
+    // that never appear in the loop's own condition/control at all.
+    std::set<uint8_t> pinLoopCarriedVars(int bodyLo, int bodyHi, uint32_t fromPc, uint32_t toPc, std::vector<StmtPtr>& result)
+    {
+        std::set<uint8_t> pinned;
+        for (uint8_t reg : collectWrittenRegs(proto_, bodyLo, bodyHi))
+        {
+            if (!tracker_.hasLiveValue(reg))
+                continue; // first write inside the loop -- a genuine fresh temp/local, not carried in
+            std::string name = tracker_.localNameAt(reg, fromPc).value_or(tracker_.freshSyntheticName());
+            tracker_.pinAsVariable(reg, fromPc, toPc, name);
+            pinned.insert(reg);
+        }
+        for (StmtPtr& s : tracker_.takeStmts())
+            result.push_back(std::move(s));
+        return pinned;
     }
 
     // Main recursive worker: structures instructions [lo, hi) into a
@@ -380,6 +486,8 @@ private:
         tracker_.bindLocal(static_cast<uint8_t>(prep.a + 2), loopVar);
 
         LoopCtx ctx{E, fornLoopIdx};
+        uint32_t exitPc = (E < static_cast<int32_t>(proto_.instructions.size())) ? proto_.instructions[E].pc : proto_.totalWordCount;
+        pinLoopCarriedVars(P + 1, fornLoopIdx, bodyStartPc, exitPc, result);
         std::vector<StmtPtr> body = structureRange(P + 1, fornLoopIdx, &ctx);
 
         StmtPtr s = std::make_shared<Stmt>();
@@ -390,6 +498,12 @@ private:
         s->forStep = stepIsDefaultOne ? nullptr : stepExpr;
         s->body = std::move(body);
         result.push_back(s);
+        // Loop-internal registers are dead once the loop ends; clear them
+        // so a later, unrelated reuse of the same register number doesn't
+        // get mistaken for a stale "live value from before".
+        tracker_.clearRegister(prep.a);
+        tracker_.clearRegister(static_cast<uint8_t>(prep.a + 1));
+        tracker_.clearRegister(static_cast<uint8_t>(prep.a + 2));
         return E;
     }
 
@@ -448,6 +562,8 @@ private:
         }
 
         LoopCtx ctx{E, loopIdx};
+        uint32_t genForExitPc = (E < static_cast<int32_t>(proto_.instructions.size())) ? proto_.instructions[E].pc : proto_.totalWordCount;
+        pinLoopCarriedVars(bodyStart, loopIdx, bodyStartPc, genForExitPc, result);
         std::vector<StmtPtr> body = structureRange(bodyStart, loopIdx, &ctx);
 
         StmtPtr s = std::make_shared<Stmt>();
@@ -460,6 +576,12 @@ private:
             s->forExprs.push_back(ctrlExpr);
         s->body = std::move(body);
         result.push_back(s);
+        // Loop-internal registers are dead once the loop ends; clear them
+        // (generator/state/control plus the user variables) so a later,
+        // unrelated reuse of the same register numbers isn't mistaken for
+        // a stale "live value from before".
+        for (uint32_t k = 0; k < nvars + 3; ++k)
+            tracker_.clearRegister(static_cast<uint8_t>(prep.a + k));
         return E;
     }
 
@@ -484,7 +606,8 @@ private:
             ++scan;
         }
 
-        bool isWhile = scan < BJ && isConditionalJump(proto_.instructions[scan].op) && proto_.instructions[scan].jumpTarget > BJ;
+        bool isWhile = scan < BJ && isConditionalJump(proto_.instructions[scan].op) && proto_.instructions[scan].jumpTarget > BJ &&
+                       (scan + 1 != BJ);
 
         if (isWhile)
         {
@@ -498,6 +621,7 @@ private:
             pinConditionRegs(proto_.instructions[scan], proto_.instructions[scan].pc, exitPc, result, /*pinAtomsToo=*/true);
             ExprPtr cond = buildCondition(proto_.instructions[scan]);
             LoopCtx ctx{BJ + 1, H};
+            pinLoopCarriedVars(scan + 1, BJ, proto_.instructions[scan + 1].pc, exitPc, result);
             std::vector<StmtPtr> body = structureRange(scan + 1, BJ, &ctx);
 
             StmtPtr s = std::make_shared<Stmt>();
@@ -524,7 +648,14 @@ private:
                 // *inside* the body (e.g. `until j >= 5` after `j = j +
                 // 1`), which precedes the condition check in program
                 // order for repeat-until.
-                pinConditionRegs(proto_.instructions[condIdx], proto_.instructions[H].pc, exitPc, result, /*pinAtomsToo=*/true);
+                // Note: unlike while, we deliberately do *not* call
+                // pinConditionRegs here -- the until-condition's operand
+                // registers may be set by instructions *inside* the body
+                // itself (e.g. a fresh constant reload right before the
+                // check), which hasn't run yet at this point. Genuinely
+                // loop-carried registers (e.g. the counter being tested)
+                // are still caught by pinLoopCarriedVars below.
+                pinLoopCarriedVars(H, condIdx, proto_.instructions[H].pc, exitPc, result);
 
                 LoopCtx ctx{exitIdx, H};
                 std::vector<StmtPtr> body = structureRange(H, condIdx, &ctx);

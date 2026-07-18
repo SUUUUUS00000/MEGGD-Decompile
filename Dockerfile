@@ -5,10 +5,10 @@ RUN apt-get update && apt-get install -y cmake g++ wget
 WORKDIR /app
 COPY . .
 
-# Download the single-file cpp-httplib library
-RUN wget https://raw.githubusercontent.com/yhirose/cpp-httplib/master/httplib.h
+# Скачиваем httplib.h напрямую в папку include
+RUN wget -O include/httplib.h https://raw.githubusercontent.com/yhirose/cpp-httplib/master/httplib.h
 
-RUN mkdir build && cd build && cmake .. && make -j4
+RUN mkdir build && cd build && cmake .. && make
 
 FROM ubuntu:22.04
 

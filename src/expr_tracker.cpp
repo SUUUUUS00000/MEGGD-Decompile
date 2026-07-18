@@ -65,6 +65,11 @@ std::optional<std::string> ExprTracker::activeLocalName(uint8_t r, uint32_t pc) 
 
 std::string ExprTracker::freshSyntheticName() { return freshName(); }
 
+bool ExprTracker::isCompoundPending(uint8_t r) const
+{
+    return r < regExpr_.size() && regExpr_[r] != nullptr && !regIsAtom_[r];
+}
+
 void ExprTracker::pinAsVariable(uint8_t r, uint32_t fromPc, uint32_t toPc, const std::string& name)
 {
     if (r < regExpr_.size() && regExpr_[r] && regExpr_[r]->kind == EK::Local && regExpr_[r]->str == name &&
@@ -169,6 +174,14 @@ void ExprTracker::produceValue(uint8_t r, ExprPtr value, bool isAtom, uint32_t n
 void ExprTracker::bindLocal(uint8_t r, const std::string& name)
 {
     setReg(r, Expr::mkLocal(name), true);
+}
+
+void ExprTracker::bindParam(uint8_t r, const std::string& name)
+{
+    setReg(r, Expr::mkLocal(name), true);
+    syntheticLocals_.push_back(SyntheticLocal{r, 0, proto_.totalWordCount, name});
+    if (r < declaredName_.size())
+        declaredName_[r] = name;
 }
 
 void ExprTracker::setReg(uint8_t r, ExprPtr e, bool isAtom)

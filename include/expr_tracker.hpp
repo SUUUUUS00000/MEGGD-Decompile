@@ -138,6 +138,14 @@ public:
     // generate one for pinAsVariable when no debug name is available).
     std::string freshSyntheticName();
 
+    // Explicitly drops any pending value for register r. Used by the
+    // structurizer after a loop construct is fully processed to clear its
+    // internal control registers (limit/step, generator/state/control),
+    // which are otherwise indistinguishable from a genuinely live value
+    // if the compiler later reuses the same register number for something
+    // in completely unrelated code.
+    void clearRegister(uint8_t r);
+
 private:
     const Module& module_;
     const Proto& proto_;

@@ -70,6 +70,16 @@ bool ExprTracker::isCompoundPending(uint8_t r) const
     return r < regExpr_.size() && regExpr_[r] != nullptr && !regIsAtom_[r];
 }
 
+bool ExprTracker::hasLiveValue(uint8_t r) const
+{
+    return r < regExpr_.size() && regExpr_[r] != nullptr;
+}
+
+void ExprTracker::clearRegister(uint8_t r)
+{
+    clearReg(r);
+}
+
 void ExprTracker::pinAsVariable(uint8_t r, uint32_t fromPc, uint32_t toPc, const std::string& name)
 {
     if (r < regExpr_.size() && regExpr_[r] && regExpr_[r]->kind == EK::Local && regExpr_[r]->str == name &&

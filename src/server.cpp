@@ -12,29 +12,65 @@
 #include <string>
 #include <cstdlib>
 #include <vector>
+#include <cctype>
 
-// Helper to decode Base64 payload safely.
-std::string base64_decode(const std::string& in)
-{
-    std::string out;
-    std::vector<int> T(256, -1);
-    for (int i = 0; i < 64; i++) 
-        T[static_cast<unsigned char>("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"[i])] = i;
+static const std::string base64_chars = 
+             "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+             "abcdefghijklmnopqrstuvwxyz"
+             "0123456789+/";
 
-    int val = 0, valb = -8;
-    for (unsigned char c : in)
-    {
-        if (T[c] == -1) 
-            continue;
-        val = (val << 6) + T[c];
-        valb += 6;
-        if (valb >= 0)
-        {
-            out.push_back(char((val >> valb) & 0xFF));
-            valb -= 8;
-        }
+static inline bool is_base64(unsigned char c) {
+  return (std::isalnum(c) || (c == '+') || (c == '/'));
+}
+
+// Industry-standard safe Base64 decoder with pre-cleaning.
+std::string base64_decode(std::string const& encoded_string) {
+  std::string clean_string;
+  clean_string.reserve(encoded_string.size());
+  for (char c : encoded_string) {
+    if (is_base64(c) || c == '=') {
+      clean_string.push_back(c);
     }
-    return out;
+  }
+
+  int in_len = clean_string.size();
+  int i = 0;
+  int j = 0;
+  int in_ = 0;
+  unsigned char char_array_4[4], char_array_3[3];
+  std::string ret;
+
+  while (in_len-- && ( clean_string[in_] != '=') && is_base64(clean_string[in_])) {
+    char_array_4[i++] = clean_string[in_]; in_++;
+    if (i == 4) {
+      for (i = 0; i < 4; i++)
+        char_array_4[i] = base64_chars.find(char_array_4[i]);
+
+      char_array_3[0] = (char_array_4[0] << 2) + ((char_array_4[1] & 0x30) >> 4);
+      char_array_3[1] = ((char_array_4[1] & 0xf) << 4) + ((char_array_4[2] & 0x3c) >> 2);
+      char_array_3[2] = ((char_array_4[2] & 0x3) << 6) + char_array_4[3];
+
+      for (i = 0; (i < 3); i++)
+        ret += char_array_3[i];
+      i = 0;
+    }
+  }
+
+  if (i) {
+    for (j = i; j < 4; j++)
+      char_array_4[j] = 0;
+
+    for (j = 0; j < 4; j++)
+      char_array_4[j] = base64_chars.find(char_array_4[j]);
+
+    char_array_3[0] = (char_array_4[0] << 2) + ((char_array_4[1] & 0x30) >> 4);
+    char_array_3[1] = ((char_array_4[1] & 0xf) << 4) + ((char_array_4[2] & 0x3c) >> 2);
+    char_array_3[2] = ((char_array_4[2] & 0x3) << 6) + char_array_4[3];
+
+    for (j = 0; (j < i - 1); j++) ret += char_array_3[j];
+  }
+
+  return ret;
 }
 
 int main()
@@ -50,7 +86,7 @@ int main()
             std::string raw_data = req.body;
 
             // If the payload does not start with a valid Luau version byte (3..12),
-            // but looks like a Base64 string, we decode it first to bypass exploit null-byte truncation.
+            // but looks like a Base64 string, we decode it first.
             if (!raw_data.empty() && (raw_data[0] < 3 || raw_data[0] > 12))
             {
                 raw_data = base64_decode(req.body);

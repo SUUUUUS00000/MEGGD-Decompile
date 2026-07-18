@@ -31,20 +31,9 @@ ExprTracker::ExprTracker(const Module& module, const Proto& proto) : module_(mod
     size_t n = std::max<size_t>(proto.maxStackSize, 1) + 8; // small margin
     regExpr_.assign(n, nullptr);
     regIsAtom_.assign(n, false);
-    declaredLocalIdx_.assign(n, -1);
+    declaredName_.assign(n, std::nullopt);
     tableAccum_.assign(n, std::nullopt);
     nameHint_.assign(n, std::nullopt);
-}
-
-std::optional<std::string> ExprTracker::localNameAt(uint8_t r, uint32_t pc) const
-{
-    for (size_t i = 0; i < proto_.locals.size(); ++i)
-    {
-        const LocalVarInfo& lv = proto_.locals[i];
-        if (lv.reg == r && lv.startpc <= pc && pc < lv.endpc && lv.nameString)
-            return module_.str(*lv.nameString);
-    }
-    return std::nullopt;
 }
 
 static int findLocalIndex(const Proto& proto, uint8_t r, uint32_t pc)
@@ -56,6 +45,39 @@ static int findLocalIndex(const Proto& proto, uint8_t r, uint32_t pc)
             return static_cast<int>(i);
     }
     return -1;
+}
+
+std::optional<std::string> ExprTracker::localNameAt(uint8_t r, uint32_t pc) const
+{
+    return activeLocalName(r, pc);
+}
+
+std::optional<std::string> ExprTracker::activeLocalName(uint8_t r, uint32_t pc) const
+{
+    for (const SyntheticLocal& sl : syntheticLocals_)
+        if (sl.reg == r && sl.startpc <= pc && pc < sl.endpc)
+            return sl.name;
+    int idx = findLocalIndex(proto_, r, pc);
+    if (idx >= 0 && proto_.locals[idx].nameString)
+        return module_.str(*proto_.locals[idx].nameString);
+    return std::nullopt;
+}
+
+std::string ExprTracker::freshSyntheticName() { return freshName(); }
+
+void ExprTracker::pinAsVariable(uint8_t r, uint32_t fromPc, uint32_t toPc, const std::string& name)
+{
+    if (r < regExpr_.size() && regExpr_[r] && regExpr_[r]->kind == EK::Local && regExpr_[r]->str == name &&
+        r < declaredName_.size() && declaredName_[r] && *declaredName_[r] == name)
+    {
+        return; // already pinned to this exact name
+    }
+    ExprPtr current = regValue(r); // consumes if compound; safe re-read if already an atom/Local
+    stmts_.push_back(Stmt::mkLocal({Expr::mkLocal(name)}, {current}));
+    syntheticLocals_.push_back(SyntheticLocal{r, fromPc, toPc, name});
+    if (r < declaredName_.size())
+        declaredName_[r] = name;
+    setReg(r, Expr::mkLocal(name), true);
 }
 
 std::string ExprTracker::freshName()
@@ -136,8 +158,7 @@ ExprPtr ExprTracker::constantExpr(uint32_t idx) const
 
 void ExprTracker::produceValue(uint8_t r, ExprPtr value, bool isAtom, uint32_t nextPc)
 {
-    int idx = findLocalIndex(proto_, r, nextPc);
-    if (idx >= 0)
+    if (activeLocalName(r, nextPc).has_value())
     {
         emitNamedWrite(r, nextPc, std::move(value));
         return;
@@ -200,19 +221,8 @@ ExprPtr ExprTracker::regValue(uint8_t r)
 
 void ExprTracker::emitNamedWrite(uint8_t r, uint32_t nextPc, ExprPtr value)
 {
-    int idx = findLocalIndex(proto_, r, nextPc);
-    if (idx < 0)
-    {
-        // No debug-info local covers this register going forward; still
-        // materialize (caller decided this needs a statement), synthesize
-        // a name.
-        std::string name = freshName();
-        stmts_.push_back(Stmt::mkLocal({Expr::mkLocal(name)}, {value}));
-        setReg(r, Expr::mkLocal(name), true);
-        return;
-    }
-    bool alreadyDeclared = (r < declaredLocalIdx_.size() && declaredLocalIdx_[r] == idx);
-    std::string name = module_.strOr(proto_.locals[idx].nameString, "_");
+    std::string name = activeLocalName(r, nextPc).value_or(freshName());
+    bool alreadyDeclared = (r < declaredName_.size() && declaredName_[r] && *declaredName_[r] == name);
     if (alreadyDeclared)
     {
         stmts_.push_back(Stmt::mkAssign({Expr::mkLocal(name)}, {value}));
@@ -220,8 +230,8 @@ void ExprTracker::emitNamedWrite(uint8_t r, uint32_t nextPc, ExprPtr value)
     else
     {
         stmts_.push_back(Stmt::mkLocal({Expr::mkLocal(name)}, {value}));
-        if (r < declaredLocalIdx_.size())
-            declaredLocalIdx_[r] = idx;
+        if (r < declaredName_.size())
+            declaredName_[r] = name;
     }
     setReg(r, Expr::mkLocal(name), true);
 }
@@ -299,18 +309,15 @@ void ExprTracker::step(const Instruction& insn, uint32_t nextPc)
         else
         {
             uint32_t count = n - 1;
-            std::vector<ExprPtr> targets;
-            for (uint32_t i = 0; i < count; ++i)
-                targets.push_back(Expr::mkReg(insn.a + i)); // placeholder, named below
             std::vector<ExprPtr> names;
             for (uint32_t i = 0; i < count; ++i)
             {
-                int idx = findLocalIndex(proto_, static_cast<uint8_t>(insn.a + i), nextPc);
-                std::string nm = idx >= 0 ? module_.strOr(proto_.locals[idx].nameString, "_") : freshName();
+                uint8_t reg = static_cast<uint8_t>(insn.a + i);
+                std::string nm = activeLocalName(reg, nextPc).value_or(freshName());
                 names.push_back(Expr::mkLocal(nm));
-                setReg(static_cast<uint8_t>(insn.a + i), Expr::mkLocal(nm), true);
-                if (idx >= 0 && (insn.a + i) < declaredLocalIdx_.size())
-                    declaredLocalIdx_[insn.a + i] = idx;
+                setReg(reg, Expr::mkLocal(nm), true);
+                if (reg < declaredName_.size())
+                    declaredName_[reg] = nm;
             }
             stmts_.push_back(Stmt::mkLocal(names, {Expr::mkVararg()}));
         }
@@ -377,9 +384,9 @@ void ExprTracker::step(const Instruction& insn, uint32_t nextPc)
         setReg(insn.a, t, false);
         tableAccum_[insn.a] = TableAccum{t, 1};
         {
-            int idx = findLocalIndex(proto_, insn.a, nextPc);
-            if (idx >= 0)
-                nameHint_[insn.a] = module_.strOr(proto_.locals[idx].nameString, "_");
+            auto name = activeLocalName(insn.a, nextPc);
+            if (name)
+                nameHint_[insn.a] = *name;
         }
         break;
     }
@@ -389,9 +396,9 @@ void ExprTracker::step(const Instruction& insn, uint32_t nextPc)
         setReg(insn.a, t, false);
         tableAccum_[insn.a] = TableAccum{t, 1};
         {
-            int idx = findLocalIndex(proto_, insn.a, nextPc);
-            if (idx >= 0)
-                nameHint_[insn.a] = module_.strOr(proto_.locals[idx].nameString, "_");
+            auto name = activeLocalName(insn.a, nextPc);
+            if (name)
+                nameHint_[insn.a] = *name;
         }
         break;
     }
@@ -497,7 +504,12 @@ void ExprTracker::step(const Instruction& insn, uint32_t nextPc)
     case Op::NEWCLOSURE:
     {
         uint32_t globalIdx = (insn.d >= 0 && static_cast<size_t>(insn.d) < proto_.childProtoIds.size()) ? proto_.childProtoIds[insn.d] : 0;
-        produceValue(insn.a, Expr::mkFunction(globalIdx), true, nextPc);
+        // Always materialize (even without a debug name) rather than
+        // defer: an inlined anonymous function literal at its own call
+        // site (`(function() ... end)(...)`) is technically correct but
+        // reads nothing like the original `local f = function() ... end;
+        // f(...)` or `local function f() ... end`.
+        emitNamedWrite(insn.a, nextPc, Expr::mkFunction(globalIdx));
         break;
     }
     case Op::DUPCLOSURE:
@@ -506,7 +518,7 @@ void ExprTracker::step(const Instruction& insn, uint32_t nextPc)
         uint32_t cidx = static_cast<uint32_t>(insn.d);
         if (cidx < proto_.constants.size() && proto_.constants[cidx].tag == ConstTag::Closure)
             globalIdx = proto_.constants[cidx].closureProto;
-        produceValue(insn.a, Expr::mkFunction(globalIdx), true, nextPc);
+        emitNamedWrite(insn.a, nextPc, Expr::mkFunction(globalIdx));
         break;
     }
 
@@ -596,18 +608,16 @@ void ExprTracker::materializeMultiWrite(uint8_t startReg, uint32_t count, ExprPt
 {
     std::vector<ExprPtr> names;
     bool allDeclared = true;
-    std::vector<int> idxs(count);
     for (uint32_t i = 0; i < count; ++i)
     {
-        int idx = findLocalIndex(proto_, static_cast<uint8_t>(startReg + i), nextPc);
-        idxs[i] = idx;
-        std::string nm = idx >= 0 ? module_.strOr(proto_.locals[idx].nameString, "_") : freshName();
+        uint8_t reg = static_cast<uint8_t>(startReg + i);
+        std::string nm = activeLocalName(reg, nextPc).value_or(freshName());
         names.push_back(Expr::mkLocal(nm));
-        bool declared = idx >= 0 && (startReg + i) < declaredLocalIdx_.size() && declaredLocalIdx_[startReg + i] == idx;
+        bool declared = reg < declaredName_.size() && declaredName_[reg] && *declaredName_[reg] == nm;
         allDeclared = allDeclared && declared;
-        setReg(static_cast<uint8_t>(startReg + i), Expr::mkLocal(nm), true);
-        if (idx >= 0 && (startReg + i) < declaredLocalIdx_.size())
-            declaredLocalIdx_[startReg + i] = idx;
+        setReg(reg, Expr::mkLocal(nm), true);
+        if (reg < declaredName_.size())
+            declaredName_[reg] = nm;
     }
     std::vector<ExprPtr> values{multiValueExpr};
     if (count > 0 && allDeclared)

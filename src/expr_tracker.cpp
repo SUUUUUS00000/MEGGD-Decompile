@@ -145,6 +145,11 @@ void ExprTracker::produceValue(uint8_t r, ExprPtr value, bool isAtom, uint32_t n
     setReg(r, std::move(value), isAtom);
 }
 
+void ExprTracker::bindLocal(uint8_t r, const std::string& name)
+{
+    setReg(r, Expr::mkLocal(name), true);
+}
+
 void ExprTracker::setReg(uint8_t r, ExprPtr e, bool isAtom)
 {
     if (r >= regExpr_.size())

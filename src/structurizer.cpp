@@ -388,6 +388,12 @@ private:
 
     int handleWhileOrRepeat(int H, int BJ, std::vector<StmtPtr>& result)
     {
+        // Recursive structureRange calls below may start exactly at H
+        // (the while-condition setup range, or the repeat body range) --
+        // erase the map entry first so those calls don't immediately
+        // re-detect this same loop and recurse forever.
+        whileRepeatMap_.erase(H);
+
         // Scan forward from H through straight-line instructions looking
         // for an early conditional exit (a `while` loop's condition
         // check). If we hit anything else first (another branch, or reach

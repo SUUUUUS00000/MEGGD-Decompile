@@ -88,7 +88,8 @@ public:
     std::string constantNameOnly(uint32_t idx) const;
 
     // Looks up the active named local covering register r at word-pc pc,
-    // if any.
+    // if any (checks synthetic pins from pinAsVariable first, then real
+    // debug-info locals).
     std::optional<std::string> localNameAt(uint8_t r, uint32_t pc) const;
 
     // Directly binds register r to a stable named-local reference (used by
@@ -97,15 +98,45 @@ public:
     // instruction the tracker would otherwise see).
     void bindLocal(uint8_t r, const std::string& name);
 
+    // Forces register r to be treated as a real, stably-named variable for
+    // word-pc range [fromPc, toPc), regardless of debug info: materializes
+    // its current value (consuming it if compound) into `local name =
+    // <current value>` right now, and remembers the binding so any later
+    // write to r within that pc range is emitted as a real `name = ...`
+    // assignment instead of being silently deferred/frozen. Used when a
+    // register is read by a loop/branch condition and therefore needs a
+    // stable identity across the construct it guards (e.g. an unnamed
+    // loop counter that's both tested and incremented, in bytecode with no
+    // debug info to tell us its real name).
+    void pinAsVariable(uint8_t r, uint32_t fromPc, uint32_t toPc, const std::string& name);
+
+    // Synthesizes a fresh v0/v1/... name (exposed so the structurizer can
+    // generate one for pinAsVariable when no debug name is available).
+    std::string freshSyntheticName();
+
 private:
     const Module& module_;
     const Proto& proto_;
 
     std::vector<ExprPtr> regExpr_;      // pending symbolic values per register
     std::vector<bool> regIsAtom_;       // true if regExpr_[r] is safe to re-read without consuming
-    std::vector<int> declaredLocalIdx_; // which proto_.locals[] entry (if any) is the last one declared for reg r; -1 if none yet
+    std::vector<std::optional<std::string>> declaredName_; // name last declared (via `local`) for reg r, if any
     std::vector<StmtPtr> stmts_;
     int freshCounter_ = 0;
+
+    struct SyntheticLocal
+    {
+        uint8_t reg;
+        uint32_t startpc;
+        uint32_t endpc;
+        std::string name;
+    };
+    std::vector<SyntheticLocal> syntheticLocals_;
+
+    // Unified lookup used internally by produceValue/emitNamedWrite: checks
+    // syntheticLocals_ (most specific / most recently pinned) before
+    // falling back to proto_.locals.
+    std::optional<std::string> activeLocalName(uint8_t r, uint32_t pc) const;
 
     void setReg(uint8_t r, ExprPtr e, bool isAtom);
     void clearReg(uint8_t r);

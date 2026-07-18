@@ -44,6 +44,33 @@ bool isForPrep(Op op)
     return op == Op::FORGPREP || op == Op::FORGPREP_INEXT || op == Op::FORGPREP_NEXT;
 }
 
+// Registers a conditional-jump instruction reads as comparison operands
+// (not counting constant/immediate operands). Used to decide which
+// registers need pinning to a stable variable before a branch/loop
+// condition is built -- see Structurizer::pinConditionRegs.
+std::vector<uint8_t> conditionOperandRegs(const Instruction& insn)
+{
+    switch (insn.op)
+    {
+    case Op::JUMPIF:
+    case Op::JUMPIFNOT:
+    case Op::JUMPXEQKNIL:
+    case Op::JUMPXEQKB:
+    case Op::JUMPXEQKN:
+    case Op::JUMPXEQKS:
+        return {insn.a};
+    case Op::JUMPIFEQ:
+    case Op::JUMPIFLE:
+    case Op::JUMPIFLT:
+    case Op::JUMPIFNOTEQ:
+    case Op::JUMPIFNOTLE:
+    case Op::JUMPIFNOTLT:
+        return {insn.a, auxA(insn.aux)};
+    default:
+        return {};
+    }
+}
+
 } // namespace
 
 class Structurizer
@@ -52,6 +79,22 @@ public:
     Structurizer(const Module& module, const Proto& proto) : module_(module), proto_(proto), tracker_(module, proto)
     {
         buildWhileRepeatMap();
+        bindParams();
+    }
+
+    // Registers 0..numParams-1 hold the function's parameters from entry
+    // (pc 0) with no explicit "write" instruction of their own -- without
+    // this, the tracker has no recorded value for them at all and body
+    // references would fall back to a raw `R0`-style placeholder. Naming
+    // here must match CodePrinter::paramNames exactly so the signature
+    // and body agree.
+    void bindParams()
+    {
+        for (uint8_t i = 0; i < proto_.numParams; ++i)
+        {
+            std::string name = tracker_.localNameAt(i, 0).value_or("p" + std::to_string(i));
+            tracker_.bindParam(i, name);
+        }
     }
 
     std::vector<StmtPtr> run() { return structureRange(0, static_cast<int>(proto_.instructions.size()), nullptr); }
@@ -89,50 +132,84 @@ private:
         }
     }
 
-    // Builds the *normalized* condition for a conditional-jump instruction,
-    // such that "fallthrough" always means "condition true" (negating or
-    // flipping the comparison as needed per-opcode -- see structurizer.cpp
-    // commit message / design notes for the polarity table this follows).
-    ExprPtr buildCondition(const Instruction& insn)
+    // Builds the condition for a conditional-jump instruction.
+    // fallthroughIsTrue=true (if-statements, while-loops): normalizes so
+    // that *falling through* means "condition true" -- negating/flipping
+    // per-opcode as needed, since about half the family jumps on true and
+    // half jumps on false.
+    // fallthroughIsTrue=false (repeat...until): returns the *raw*
+    // jump-is-true reading instead, since "until COND" exits (jumps)
+    // exactly when COND holds -- no fallthrough normalization wanted
+    // there.
+    ExprPtr buildCondition(const Instruction& insn, bool fallthroughIsTrue = true)
     {
+        auto pick = [&](BinOpKind whenFallthroughConvention, BinOpKind whenRawConvention) {
+            return fallthroughIsTrue ? whenFallthroughConvention : whenRawConvention;
+        };
         switch (insn.op)
         {
-        case Op::JUMPIF:
-            return Expr::mkUnary(UnOpKind::Not, tracker_.regValue(insn.a));
-        case Op::JUMPIFNOT:
-            return tracker_.regValue(insn.a);
-        case Op::JUMPIFEQ:
-            return Expr::mkBinary(BinOpKind::Ne, tracker_.regValue(insn.a), tracker_.regValue(auxA(insn.aux)));
-        case Op::JUMPIFLE:
-            return Expr::mkBinary(BinOpKind::Gt, tracker_.regValue(insn.a), tracker_.regValue(auxA(insn.aux)));
-        case Op::JUMPIFLT:
-            return Expr::mkBinary(BinOpKind::Ge, tracker_.regValue(insn.a), tracker_.regValue(auxA(insn.aux)));
-        case Op::JUMPIFNOTEQ:
-            return Expr::mkBinary(BinOpKind::Eq, tracker_.regValue(insn.a), tracker_.regValue(auxA(insn.aux)));
-        case Op::JUMPIFNOTLE:
-            return Expr::mkBinary(BinOpKind::Le, tracker_.regValue(insn.a), tracker_.regValue(auxA(insn.aux)));
-        case Op::JUMPIFNOTLT:
-            return Expr::mkBinary(BinOpKind::Lt, tracker_.regValue(insn.a), tracker_.regValue(auxA(insn.aux)));
+        case Op::JUMPIF: // jump=truthy
+            return fallthroughIsTrue ? Expr::mkUnary(UnOpKind::Not, tracker_.regValue(insn.a)) : tracker_.regValue(insn.a);
+        case Op::JUMPIFNOT: // jump=falsy
+            return fallthroughIsTrue ? tracker_.regValue(insn.a) : Expr::mkUnary(UnOpKind::Not, tracker_.regValue(insn.a));
+        case Op::JUMPIFEQ: // jump=(a==aux)
+            return Expr::mkBinary(pick(BinOpKind::Ne, BinOpKind::Eq), tracker_.regValue(insn.a), tracker_.regValue(auxA(insn.aux)));
+        case Op::JUMPIFLE: // jump=(a<=aux)
+            return Expr::mkBinary(pick(BinOpKind::Gt, BinOpKind::Le), tracker_.regValue(insn.a), tracker_.regValue(auxA(insn.aux)));
+        case Op::JUMPIFLT: // jump=(a<aux)
+            return Expr::mkBinary(pick(BinOpKind::Ge, BinOpKind::Lt), tracker_.regValue(insn.a), tracker_.regValue(auxA(insn.aux)));
+        case Op::JUMPIFNOTEQ: // jump=(a~=aux)
+            return Expr::mkBinary(pick(BinOpKind::Eq, BinOpKind::Ne), tracker_.regValue(insn.a), tracker_.regValue(auxA(insn.aux)));
+        case Op::JUMPIFNOTLE: // jump=(a>aux)
+            return Expr::mkBinary(pick(BinOpKind::Le, BinOpKind::Gt), tracker_.regValue(insn.a), tracker_.regValue(auxA(insn.aux)));
+        case Op::JUMPIFNOTLT: // jump=(a>=aux)
+            return Expr::mkBinary(pick(BinOpKind::Lt, BinOpKind::Ge), tracker_.regValue(insn.a), tracker_.regValue(auxA(insn.aux)));
         case Op::JUMPXEQKNIL:
-            return auxNot(insn.aux) ? Expr::mkBinary(BinOpKind::Eq, tracker_.regValue(insn.a), Expr::mkNil())
-                                     : Expr::mkBinary(BinOpKind::Ne, tracker_.regValue(insn.a), Expr::mkNil());
+        {
+            bool jumpMeansEqual = !auxNot(insn.aux); // notFlag=0 => jump when equal
+            bool wantEqual = fallthroughIsTrue ? !jumpMeansEqual : jumpMeansEqual;
+            return Expr::mkBinary(wantEqual ? BinOpKind::Eq : BinOpKind::Ne, tracker_.regValue(insn.a), Expr::mkNil());
+        }
         case Op::JUMPXEQKB:
         {
             ExprPtr b = Expr::mkBool(auxKB(insn.aux) != 0);
-            return auxNot(insn.aux) ? Expr::mkBinary(BinOpKind::Eq, tracker_.regValue(insn.a), b)
-                                     : Expr::mkBinary(BinOpKind::Ne, tracker_.regValue(insn.a), b);
+            bool jumpMeansEqual = !auxNot(insn.aux);
+            bool wantEqual = fallthroughIsTrue ? !jumpMeansEqual : jumpMeansEqual;
+            return Expr::mkBinary(wantEqual ? BinOpKind::Eq : BinOpKind::Ne, tracker_.regValue(insn.a), b);
         }
         case Op::JUMPXEQKN:
         case Op::JUMPXEQKS:
         {
             ExprPtr k = tracker_.constantExpr(auxKV(insn.aux));
-            return auxNot(insn.aux) ? Expr::mkBinary(BinOpKind::Eq, tracker_.regValue(insn.a), k)
-                                     : Expr::mkBinary(BinOpKind::Ne, tracker_.regValue(insn.a), k);
+            bool jumpMeansEqual = !auxNot(insn.aux);
+            bool wantEqual = fallthroughIsTrue ? !jumpMeansEqual : jumpMeansEqual;
+            return Expr::mkBinary(wantEqual ? BinOpKind::Eq : BinOpKind::Ne, tracker_.regValue(insn.a), k);
         }
         case Op::CMPPROTO:
         default:
             return Expr::mkRaw("--[[ unsupported condition (" + std::string(opInfo(static_cast<uint8_t>(insn.op)).name) + ") ]] true");
         }
+    }
+
+    // Forces every register the condition instruction reads to a stable
+    // named-variable binding valid through [pc, untilPc), before the
+    // condition expression itself is built. Without this, an unnamed
+    // register that's read here and *also* read or reassigned inside the
+    // branch/loop this condition guards would either appear frozen at its
+    // pre-branch value (if never consumed) or leak a raw register
+    // placeholder (if a compound value got consumed here and the branch
+    // tries to read it again).
+    void pinConditionRegs(const Instruction& condInsn, uint32_t fromPc, uint32_t untilPc, std::vector<StmtPtr>& result, bool pinAtomsToo)
+    {
+        for (uint8_t reg : conditionOperandRegs(condInsn))
+        {
+            if (!pinAtomsToo && !tracker_.isCompoundPending(reg))
+                continue; // safe to leave as a freely re-readable atom (e.g. a literal constant)
+            std::string name = tracker_.localNameAt(reg, fromPc).value_or(tracker_.freshSyntheticName());
+            tracker_.pinAsVariable(reg, fromPc, untilPc, name);
+        }
+        for (StmtPtr& s : tracker_.takeStmts())
+            result.push_back(std::move(s));
     }
 
     // Main recursive worker: structures instructions [lo, hi) into a
@@ -249,7 +326,6 @@ private:
     int handleIfElse(int J, int hi, const LoopCtx* enclosing, std::vector<StmtPtr>& result)
     {
         const Instruction& jinsn = proto_.instructions[J];
-        ExprPtr cond = buildCondition(jinsn);
         int32_t T = jinsn.jumpTarget;
 
         int32_t elseSkipTarget = -1;
@@ -264,15 +340,16 @@ private:
                 elseSkipTarget = t2;
             }
         }
+        int32_t resumeAt = hasElse ? elseSkipTarget : T;
+        uint32_t untilPc = (resumeAt < static_cast<int32_t>(proto_.instructions.size())) ? proto_.instructions[resumeAt].pc : proto_.totalWordCount;
+
+        pinConditionRegs(jinsn, jinsn.pc, untilPc, result, /*pinAtomsToo=*/false);
+        ExprPtr cond = buildCondition(jinsn);
 
         std::vector<StmtPtr> thenBody = structureRange(J + 1, hasElse ? (T - 1) : T, enclosing);
         std::vector<StmtPtr> elseBody;
-        int32_t resumeAt = T;
         if (hasElse)
-        {
             elseBody = structureRange(T, elseSkipTarget, enclosing);
-            resumeAt = elseSkipTarget;
-        }
 
         result.push_back(Stmt::mkIf(cond, std::move(thenBody), std::move(elseBody)));
         return resumeAt;
@@ -412,11 +489,13 @@ private:
         if (isWhile)
         {
             // Setup instructions [H, scan) are pure condition computation;
-            // process them (should yield no statements) then build cond.
+            // process them (should yield no statements) then pin+build cond.
             std::vector<StmtPtr> setupStmts = structureRange(H, scan, nullptr);
             for (StmtPtr& s : setupStmts)
                 result.push_back(std::move(s)); // rare: keep correctness if setup wasn't pure
 
+            uint32_t exitPc = (BJ + 1 < static_cast<int>(proto_.instructions.size())) ? proto_.instructions[BJ + 1].pc : proto_.totalWordCount;
+            pinConditionRegs(proto_.instructions[scan], proto_.instructions[scan].pc, exitPc, result, /*pinAtomsToo=*/true);
             ExprPtr cond = buildCondition(proto_.instructions[scan]);
             LoopCtx ctx{BJ + 1, H};
             std::vector<StmtPtr> body = structureRange(scan + 1, BJ, &ctx);
@@ -438,16 +517,25 @@ private:
             int condIdx = BJ - 1;
             if (condIdx > H && isConditionalJump(proto_.instructions[condIdx].op) && proto_.instructions[condIdx].jumpTarget > BJ)
             {
-                LoopCtx ctx{static_cast<int32_t>(proto_.instructions[condIdx].jumpTarget), H};
+                int32_t exitIdx = proto_.instructions[condIdx].jumpTarget;
+                uint32_t exitPc = (exitIdx < static_cast<int32_t>(proto_.instructions.size())) ? proto_.instructions[exitIdx].pc : proto_.totalWordCount;
+                // Pin from the loop's start (not the condition's own pc):
+                // the condition's operand registers are typically written
+                // *inside* the body (e.g. `until j >= 5` after `j = j +
+                // 1`), which precedes the condition check in program
+                // order for repeat-until.
+                pinConditionRegs(proto_.instructions[condIdx], proto_.instructions[H].pc, exitPc, result, /*pinAtomsToo=*/true);
+
+                LoopCtx ctx{exitIdx, H};
                 std::vector<StmtPtr> body = structureRange(H, condIdx, &ctx);
-                ExprPtr cond = buildCondition(proto_.instructions[condIdx]);
+                ExprPtr cond = buildCondition(proto_.instructions[condIdx], /*fallthroughIsTrue=*/false);
 
                 StmtPtr s = std::make_shared<Stmt>();
                 s->kind = SK::Repeat;
                 s->body = std::move(body);
                 s->cond = cond;
                 result.push_back(s);
-                return static_cast<int>(proto_.instructions[condIdx].jumpTarget);
+                return exitIdx;
             }
             else
             {

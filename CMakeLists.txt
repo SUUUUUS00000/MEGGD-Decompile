@@ -4,15 +4,17 @@ project(LuauDecompilerWeb)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+include_directories(include)
+
 set(SOURCES
-    bytecode_format.cpp
-    bytecode_reader.cpp
-    code_printer.cpp
-    disassembler.cpp
-    expr_tracker.cpp
-    structurizer.cpp
-    decompiler.cpp
-    server.cpp
+    src/bytecode_format.cpp
+    src/bytecode_reader.cpp
+    src/code_printer.cpp
+    src/disassembler.cpp
+    src/expr_tracker.cpp
+    src/structurizer.cpp
+    src/decompiler.cpp
+    src/server.cpp
 )
 
 add_executable(luau_decompiler_server ${SOURCES})

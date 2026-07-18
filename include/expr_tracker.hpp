@@ -98,6 +98,14 @@ public:
     // instruction the tracker would otherwise see).
     void bindLocal(uint8_t r, const std::string& name);
 
+    // Like bindLocal, but also registers a synthetic local spanning
+    // [0, functionEnd) with no initializer statement (the function's own
+    // signature is the declaration) -- used for parameters, so that a
+    // later reassignment to a parameter (e.g. `function f(x) x = x or 1
+    // end`) is correctly emitted as `x = x or 1` instead of being
+    // silently treated as an anonymous compiler temp.
+    void bindParam(uint8_t r, const std::string& name);
+
     // Forces register r to be treated as a real, stably-named variable for
     // word-pc range [fromPc, toPc), regardless of debug info: materializes
     // its current value (consuming it if compound) into `local name =
@@ -109,6 +117,22 @@ public:
     // loop counter that's both tested and incremented, in bytecode with no
     // debug info to tell us its real name).
     void pinAsVariable(uint8_t r, uint32_t fromPc, uint32_t toPc, const std::string& name);
+
+    // True if register r currently holds a pending *compound* value (one
+    // that regValue() would consume/clear on read) rather than a freely
+    // re-readable atom or nothing at all. The structurizer uses this to
+    // decide which condition-operand registers actually need pinning:
+    // compounds always do (reading them once already clears them, so a
+    // second read inside a branch would otherwise see nothing); bare
+    // atoms don't unless they're also going to be *reassigned* inside a
+    // loop this condition guards (a separate, loop-specific concern).
+    bool isCompoundPending(uint8_t r) const;
+
+    // True if register r currently holds *any* pending value (atom or
+    // compound) -- used to detect loop-carried variables: a register
+    // written before a loop and reassigned inside it needs pinning even
+    // though it isn't a condition operand (e.g. an accumulator).
+    bool hasLiveValue(uint8_t r) const;
 
     // Synthesizes a fresh v0/v1/... name (exposed so the structurizer can
     // generate one for pinAsVariable when no debug name is available).

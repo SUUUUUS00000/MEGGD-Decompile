@@ -1,19 +1,17 @@
 // decompiler.hpp
 //
-// Provides the top-level API for the decompiler. Combines the
-// BytecodeReader, Structurizer, and CodePrinter stages into a single
-// function that takes a raw Luau bytecode buffer and returns the
-// decompiled source code as a string.
+// Top-level orchestration: structures every proto in a module, then
+// prints the main proto as a chunk (nested closures are expanded inline
+// by the printer using the precomputed structured bodies).
 
 #pragma once
 
-#include <cstdint>
-#include <cstddef>
+#include "bytecode_types.hpp"
 #include <string>
 
 namespace luaudec
 {
 
-std::string decompile_bytecode(const uint8_t* data, size_t size);
+std::string decompileModule(const Module& module);
 
 } // namespace luaudec

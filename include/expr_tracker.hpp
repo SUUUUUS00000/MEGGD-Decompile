@@ -91,6 +91,12 @@ public:
     // if any.
     std::optional<std::string> localNameAt(uint8_t r, uint32_t pc) const;
 
+    // Directly binds register r to a stable named-local reference (used by
+    // the structurizer for for-loop control variables, whose lifetime
+    // spans the whole loop body rather than being written by a single
+    // instruction the tracker would otherwise see).
+    void bindLocal(uint8_t r, const std::string& name);
+
 private:
     const Module& module_;
     const Proto& proto_;

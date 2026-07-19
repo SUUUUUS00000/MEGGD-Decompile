@@ -266,6 +266,124 @@ public:
     {
         buildWhileRepeatMap();
         bindParams();
+        computeMultiUseRegs();
+    }
+
+    // Whole-function pre-pass: for every register, splits its lifetime
+    // into segments between consecutive writes, and for any segment read
+    // 2+ times, pre-registers a stable synthetic name for it (found later
+    // by produceValue via activeLocalName once structuring reaches that
+    // write). This is what makes a value used across multiple *sequential*
+    // statements -- not just across a branch/loop, which the pin* helpers
+    // already handle -- get a real name instead of being inlined once and
+    // leaking a raw register reference on its second use (e.g. `local
+    // self = setmetatable(...); self.value = x; return self` without
+    // debug info: `self`'s register is read by both the field-assignment
+    // and the return).
+    void computeMultiUseRegs()
+    {
+        size_t n = std::max<size_t>(proto_.maxStackSize, 1) + 8;
+        std::vector<std::vector<int>> defsPerReg(n), readsPerReg(n);
+
+        for (int i = 0; i < static_cast<int>(proto_.instructions.size()); ++i)
+        {
+            const Instruction& insn = proto_.instructions[i];
+            if (writesRegisterA(insn.op) && insn.a < n)
+                defsPerReg[insn.a].push_back(i);
+            else if (insn.op == Op::CALL && insn.c >= 2)
+            {
+                uint32_t cnt = insn.c - 1;
+                for (uint32_t k = 0; k < cnt; ++k)
+                {
+                    uint8_t r = static_cast<uint8_t>(insn.a + k);
+                    if (r < n)
+                        defsPerReg[r].push_back(i);
+                }
+            }
+            else if (insn.op == Op::GETVARARGS && insn.b >= 2)
+            {
+                uint32_t cnt = insn.b - 1;
+                for (uint32_t k = 0; k < cnt; ++k)
+                {
+                    uint8_t r = static_cast<uint8_t>(insn.a + k);
+                    if (r < n)
+                        defsPerReg[r].push_back(i);
+                }
+            }
+            for (uint8_t r : readsRegisters(insn))
+                if (r < n)
+                    readsPerReg[r].push_back(i);
+
+            // FORNPREP/FORGPREP-family read their limit/step/start (or
+            // generator/state/control) registers to set the loop up --
+            // treat that as a read so a prior segment (e.g. a literal `1`
+            // loaded right before the loop) doesn't wrongly extend into
+            // the loop body. FORNLOOP/FORGLOOP, in turn, *implicitly*
+            // redefine the loop variable(s) on every iteration even
+            // though there's no explicit "insn.a-writes" instruction for
+            // it -- without treating them as defs here, the whole loop
+            // body's reads of the loop variable get merged into the same
+            // segment as whatever was loaded into that register *before*
+            // the loop, and the pre-pass ends up giving the loop variable
+            // the same synthesized name as that unrelated prior value.
+            if (insn.op == Op::FORNPREP)
+            {
+                for (int off = 0; off < 3; ++off)
+                {
+                    uint8_t r = static_cast<uint8_t>(insn.a + off);
+                    if (r < n)
+                        readsPerReg[r].push_back(i);
+                }
+            }
+            else if (insn.op == Op::FORNLOOP)
+            {
+                uint8_t r = static_cast<uint8_t>(insn.a + 2);
+                if (r < n)
+                    defsPerReg[r].push_back(i);
+            }
+            else if (isForPrep(insn.op))
+            {
+                for (int off = 0; off < 3; ++off)
+                {
+                    uint8_t r = static_cast<uint8_t>(insn.a + off);
+                    if (r < n)
+                        readsPerReg[r].push_back(i);
+                }
+            }
+            else if (insn.op == Op::FORGLOOP)
+            {
+                uint32_t nvars = auxA(insn.aux);
+                if (nvars == 0)
+                    nvars = 1;
+                for (uint32_t off = 0; off < nvars; ++off)
+                {
+                    uint8_t r = static_cast<uint8_t>(insn.a + 3 + off);
+                    if (r < n)
+                        defsPerReg[r].push_back(i);
+                }
+            }
+        }
+
+        for (uint8_t r = 0; r < n; ++r)
+        {
+            const std::vector<int>& defs = defsPerReg[r];
+            const std::vector<int>& reads = readsPerReg[r];
+            for (size_t di = 0; di < defs.size(); ++di)
+            {
+                int defIdx = defs[di];
+                int segEnd = (di + 1 < defs.size()) ? defs[di + 1] : static_cast<int>(proto_.instructions.size());
+                int readCount = 0;
+                for (int ri : reads)
+                    if (ri > defIdx && ri < segEnd)
+                        ++readCount;
+                if (readCount < 2)
+                    continue;
+                uint32_t fromPc = (defIdx + 1 < static_cast<int>(proto_.instructions.size())) ? proto_.instructions[defIdx + 1].pc : proto_.totalWordCount;
+                uint32_t toPc = (segEnd < static_cast<int>(proto_.instructions.size())) ? proto_.instructions[segEnd].pc : proto_.totalWordCount;
+                std::string name = tracker_.localNameAt(r, fromPc).value_or(tracker_.freshSyntheticName());
+                tracker_.registerSyntheticLocalRange(r, fromPc, toPc, name);
+            }
+        }
     }
 
     // Registers 0..numParams-1 hold the function's parameters from entry

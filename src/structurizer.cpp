@@ -5,6 +5,7 @@
 #include <unordered_map>
 #include <optional>
 #include <set>
+#include <algorithm>
 
 namespace luaudec
 {
@@ -151,6 +152,109 @@ std::set<uint8_t> collectWrittenRegs(const Proto& proto, int lo, int hi)
         }
     }
     return out;
+}
+
+// Registers read by instruction `insn` as source operands. Deliberately
+// conservative-ish (a little over-inclusive is harmless: it just means an
+// occasional register gets pinned that didn't strictly need to be).
+std::vector<uint8_t> readsRegisters(const Instruction& insn)
+{
+    switch (insn.op)
+    {
+    case Op::MOVE:
+    case Op::NOT:
+    case Op::MINUS:
+    case Op::LENGTH:
+        return {insn.b};
+    case Op::GETTABLE:
+        return {insn.b, insn.c};
+    case Op::GETTABLEN:
+    case Op::GETTABLEKS:
+    case Op::GETUDATAKS:
+        return {insn.b};
+    case Op::SETTABLE:
+        return {insn.a, insn.b, insn.c};
+    case Op::SETTABLEN:
+    case Op::SETTABLEKS:
+    case Op::SETUDATAKS:
+        return {insn.a, insn.b};
+    case Op::SETGLOBAL:
+    case Op::SETUPVAL:
+        return {insn.a};
+    case Op::ADD:
+    case Op::SUB:
+    case Op::MUL:
+    case Op::DIV:
+    case Op::MOD:
+    case Op::POW:
+    case Op::IDIV:
+    case Op::AND:
+    case Op::OR:
+    case Op::SUBRK:
+    case Op::DIVRK:
+        return {insn.b, insn.c};
+    case Op::ADDK:
+    case Op::SUBK:
+    case Op::MULK:
+    case Op::DIVK:
+    case Op::MODK:
+    case Op::POWK:
+    case Op::IDIVK:
+    case Op::ANDK:
+    case Op::ORK:
+        return {insn.b};
+    case Op::CONCAT:
+    {
+        std::vector<uint8_t> r;
+        for (int k = insn.b; k <= insn.c; ++k)
+            r.push_back(static_cast<uint8_t>(k));
+        return r;
+    }
+    case Op::CALL:
+    {
+        std::vector<uint8_t> r{insn.a};
+        if (insn.b >= 2)
+            for (uint32_t k = 0; k < insn.b - 1u; ++k)
+                r.push_back(static_cast<uint8_t>(insn.a + 1 + k));
+        return r;
+    }
+    case Op::NAMECALL:
+        return {insn.b};
+    case Op::RETURN:
+    {
+        std::vector<uint8_t> r;
+        if (insn.b >= 2)
+            for (uint32_t k = 0; k < insn.b - 1u; ++k)
+                r.push_back(static_cast<uint8_t>(insn.a + k));
+        else if (insn.b == 0)
+            r.push_back(insn.a); // multret: at least the first
+        return r;
+    }
+    case Op::SETLIST:
+    {
+        std::vector<uint8_t> r{insn.a};
+        if (insn.c >= 2)
+            for (uint32_t k = 0; k < insn.c - 1u; ++k)
+                r.push_back(static_cast<uint8_t>(insn.b + k));
+        return r;
+    }
+    case Op::JUMPIF:
+    case Op::JUMPIFNOT:
+    case Op::JUMPXEQKNIL:
+    case Op::JUMPXEQKB:
+    case Op::JUMPXEQKN:
+    case Op::JUMPXEQKS:
+        return {insn.a};
+    case Op::JUMPIFEQ:
+    case Op::JUMPIFLE:
+    case Op::JUMPIFLT:
+    case Op::JUMPIFNOTEQ:
+    case Op::JUMPIFNOTLE:
+    case Op::JUMPIFNOTLT:
+        return {insn.a, auxA(insn.aux)};
+    default:
+        return {};
+    }
 }
 
 } // namespace
@@ -434,9 +538,20 @@ private:
         const Instruction& jinsn = proto_.instructions[J];
         int32_t T = jinsn.jumpTarget;
 
+        // T can legitimately point *past* our own hi: that happens
+        // exactly when the jump path is a break/continue escaping to an
+        // enclosing loop's exit/continue point, which may sit beyond
+        // whatever sub-range we're currently structuring (e.g. a `break`
+        // as literally the last thing before a numeric-for's own
+        // FORNLOOP). Recognize that explicitly instead of letting the
+        // then-branch's range silently run past hi (which would swallow
+        // the enclosing loop's own terminator as if it were dead code).
+        bool jumpIsBreak = enclosing && T == enclosing->exitTarget;
+        bool jumpIsContinue = enclosing && !jumpIsBreak && T == enclosing->continueTarget;
+
         int32_t elseSkipTarget = -1;
         bool hasElse = false;
-        if (T - 1 >= J + 1 && T - 1 < hi && proto_.instructions[T - 1].op == Op::JUMP)
+        if (!jumpIsBreak && !jumpIsContinue && T - 1 >= J + 1 && T - 1 < hi && proto_.instructions[T - 1].op == Op::JUMP)
         {
             int32_t t2 = proto_.instructions[T - 1].jumpTarget;
             bool looksLikeBreakOrContinue = enclosing && (t2 == enclosing->exitTarget || t2 == enclosing->continueTarget);
@@ -446,16 +561,22 @@ private:
                 elseSkipTarget = t2;
             }
         }
-        int32_t resumeAt = hasElse ? elseSkipTarget : T;
+
+        int32_t thenHi = hasElse ? (T - 1) : std::min(T, static_cast<int32_t>(hi));
+        int32_t resumeAt = hasElse ? elseSkipTarget : thenHi;
         uint32_t untilPc = (resumeAt < static_cast<int32_t>(proto_.instructions.size())) ? proto_.instructions[resumeAt].pc : proto_.totalWordCount;
 
         pinConditionRegs(jinsn, jinsn.pc, untilPc, result, /*pinAtomsToo=*/false);
         ExprPtr cond = buildCondition(jinsn);
 
-        std::vector<StmtPtr> thenBody = structureRange(J + 1, hasElse ? (T - 1) : T, enclosing);
+        std::vector<StmtPtr> thenBody = structureRange(J + 1, thenHi, enclosing);
         std::vector<StmtPtr> elseBody;
         if (hasElse)
             elseBody = structureRange(T, elseSkipTarget, enclosing);
+        else if (jumpIsBreak)
+            elseBody = {Stmt::mkBreak()};
+        else if (jumpIsContinue)
+            elseBody = {Stmt::mkContinue()};
 
         result.push_back(Stmt::mkIf(cond, std::move(thenBody), std::move(elseBody)));
         return resumeAt;

@@ -118,6 +118,8 @@ public:
     // debug info to tell us its real name).
     void pinAsVariable(uint8_t r, uint32_t fromPc, uint32_t toPc, const std::string& name);
 
+    void registerSyntheticLocalRange(uint8_t r, uint32_t fromPc, uint32_t toPc, const std::string& name);
+
     // True if register r currently holds a pending *compound* value (one
     // that regValue() would consume/clear on read) rather than a freely
     // re-readable atom or nothing at all. The structurizer uses this to

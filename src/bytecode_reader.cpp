@@ -175,7 +175,20 @@ Module BytecodeReader::parseModule()
     uint32_t protoCount = readVarInt();
     module.protos.reserve(protoCount);
     for (uint32_t i = 0; i < protoCount; ++i)
-        module.protos.push_back(parseProto(i, module));
+    {
+        try
+        {
+            module.protos.push_back(parseProto(i, module));
+        }
+        catch (const BytecodeReadError& e)
+        {
+            std::ostringstream oss;
+            oss << e.what() << " [context: bytecode version=" << int(module.version) << ", typesVersion=" << int(module.typesVersion)
+                << ", " << i << " of " << protoCount << " proto headers parsed successfully before this failure, "
+                << module.strings.size() << " strings read, byte offset=" << offset_ << " of " << size_ << "]";
+            throw BytecodeReadError(oss.str());
+        }
+    }
 
     module.mainProtoId = readVarInt();
     if (module.mainProtoId >= module.protos.size())
@@ -404,7 +417,14 @@ void BytecodeReader::decodeInstructions(Proto& proto, const std::vector<uint32_t
             // output for both families; see commit message.)
             int64_t targetPc = base + offsetWords;
             if (targetPc < 0 || static_cast<uint64_t>(targetPc) > proto.totalWordCount)
-                throw BytecodeReadError("jump target out of range at pc=" + std::to_string(insn.pc));
+            {
+                std::ostringstream oss;
+                oss << "jump target out of range: proto " << proto.selfIndex << ", instruction '" << opInfo(static_cast<uint8_t>(insn.op)).name
+                    << "' at pc=" << insn.pc << " (word " << insn.pc << " of " << proto.totalWordCount << "), computed target=" << targetPc
+                    << ". This usually means either the input isn't a raw Luau bytecode blob (e.g. it's Lua source, a wrapped/encrypted "
+                    << "payload, or a different file type), or it uses a bytecode/opcode revision this reader doesn't know about yet.";
+                throw BytecodeReadError(oss.str());
+            }
             insn.jumpTarget = proto.resolveTarget(static_cast<uint32_t>(targetPc));
         }
     }

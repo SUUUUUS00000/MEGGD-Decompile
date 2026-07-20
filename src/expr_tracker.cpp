@@ -31,6 +31,7 @@ ExprTracker::ExprTracker(const Module& module, const Proto& proto) : module_(mod
     size_t n = std::max<size_t>(proto.maxStackSize, 1) + 8; // small margin
     regExpr_.assign(n, nullptr);
     regIsAtom_.assign(n, false);
+    regIsMultretTail_.assign(n, false);
     declaredName_.assign(n, std::nullopt);
     tableAccum_.assign(n, std::nullopt);
     nameHint_.assign(n, std::nullopt);
@@ -54,9 +55,14 @@ std::optional<std::string> ExprTracker::localNameAt(uint8_t r, uint32_t pc) cons
 
 std::optional<std::string> ExprTracker::activeLocalName(uint8_t r, uint32_t pc) const
 {
-    for (const SyntheticLocal& sl : syntheticLocals_)
-        if (sl.reg == r && sl.startpc <= pc && pc < sl.endpc)
-            return sl.name;
+    // Reverse order: entries added later (e.g. a loop's own
+    // pinLoopCarriedVars/pinConditionRegs call, made once structuring
+    // actually reaches that construct) are more context-specific than the
+    // whole-function multi-use pre-pass's entries (registered upfront,
+    // before any structuring happens) and should win when ranges overlap.
+    for (auto it = syntheticLocals_.rbegin(); it != syntheticLocals_.rend(); ++it)
+        if (it->reg == r && it->startpc <= pc && pc < it->endpc)
+            return it->name;
     int idx = findLocalIndex(proto_, r, pc);
     if (idx >= 0 && proto_.locals[idx].nameString)
         return module_.str(*proto_.locals[idx].nameString);
@@ -75,6 +81,11 @@ bool ExprTracker::hasLiveValue(uint8_t r) const
     return r < regExpr_.size() && regExpr_[r] != nullptr;
 }
 
+void ExprTracker::registerSyntheticLocalRange(uint8_t r, uint32_t fromPc, uint32_t toPc, const std::string& name)
+{
+    syntheticLocals_.push_back(SyntheticLocal{r, fromPc, toPc, name});
+}
+
 void ExprTracker::clearRegister(uint8_t r)
 {
     clearReg(r);
@@ -82,6 +93,9 @@ void ExprTracker::clearRegister(uint8_t r)
 
 void ExprTracker::pinAsVariable(uint8_t r, uint32_t fromPc, uint32_t toPc, const std::string& name)
 {
+#ifdef LUAUDEC_DEBUG_PREPASS
+    fprintf(stderr, "[pinAsVariable] reg=%d name=%s fromPc=%u toPc=%u\n", (int)r, name.c_str(), fromPc, toPc);
+#endif
     if (r < regExpr_.size() && regExpr_[r] && regExpr_[r]->kind == EK::Local && regExpr_[r]->str == name &&
         r < declaredName_.size() && declaredName_[r] && *declaredName_[r] == name)
     {
@@ -200,6 +214,7 @@ void ExprTracker::setReg(uint8_t r, ExprPtr e, bool isAtom)
         return;
     regExpr_[r] = std::move(e);
     regIsAtom_[r] = isAtom;
+    regIsMultretTail_[r] = false;
     tableAccum_[r] = std::nullopt;
     nameHint_[r] = std::nullopt;
 }
@@ -210,6 +225,7 @@ void ExprTracker::clearReg(uint8_t r)
         return;
     regExpr_[r] = nullptr;
     regIsAtom_[r] = false;
+    regIsMultretTail_[r] = false;
     tableAccum_[r] = std::nullopt;
     nameHint_[r] = std::nullopt;
 }
@@ -232,7 +248,14 @@ ExprPtr ExprTracker::regValue(uint8_t r)
             {
                 std::string name = *nameHint_[r];
                 stmts_.push_back(Stmt::mkLocal({Expr::mkLocal(name)}, {v}));
-                clearReg(r);
+                // Leave the register holding a re-readable reference to
+                // the now-named variable (atom), instead of clearing it
+                // outright: a self-referential use within the very same
+                // instruction (e.g. `Counter.__index = Counter`, which
+                // reads this register once as the value and once as the
+                // table base) needs the name to still be there on its
+                // second read.
+                setReg(r, Expr::mkLocal(name), true);
                 return Expr::mkLocal(name);
             }
             clearReg(r); // compound: single-use, prevent accidental duplication downstream
@@ -324,6 +347,8 @@ void ExprTracker::step(const Instruction& insn, uint32_t nextPc)
         if (n == 0)
         {
             produceValue(insn.a, Expr::mkVararg(), true, nextPc);
+            if (insn.a < regIsMultretTail_.size())
+                regIsMultretTail_[insn.a] = true;
         }
         else if (n == 2) // 1 actual value (n=count+1)
         {
@@ -430,10 +455,17 @@ void ExprTracker::step(const Instruction& insn, uint32_t nextPc)
         uint32_t count = insn.c == 0 ? 0 : (insn.c - 1);
         if (count == 0 && insn.c == 0)
         {
-            // MULTRET: scan consecutive live registers from B.
+            // MULTRET: scan consecutive live registers from B, stopping
+            // right after a multret-tail register (same reasoning as
+            // gatherRange -- nothing meaningful follows one).
             uint8_t r = insn.b;
             while (r < regExpr_.size() && regExpr_[r])
+            {
+                bool wasTail = regIsMultretTail_[r];
                 ++r;
+                if (wasTail)
+                    break;
+            }
             count = r - insn.b;
         }
         if (insn.a < tableAccum_.size() && tableAccum_[insn.a])
@@ -553,6 +585,7 @@ void ExprTracker::step(const Instruction& insn, uint32_t nextPc)
     }
 
     case Op::CALL:
+    case Op::CALLFB:
     {
         ExprPtr call = buildCallExpr(insn);
         uint32_t nres = insn.c; // count+1, 0=multret
@@ -571,6 +604,7 @@ void ExprTracker::step(const Instruction& insn, uint32_t nextPc)
             // consumer (another CALL's trailing arg, RETURN, or SETLIST)
             // will pick it up via regValue/gatherRange.
             setReg(insn.a, call, false);
+            regIsMultretTail_[insn.a] = true;
         }
         else
         {
@@ -589,7 +623,10 @@ std::vector<ExprPtr> ExprTracker::gatherRange(uint8_t startReg, uint8_t countPlu
         uint8_t r = startReg;
         while (r < regExpr_.size() && regExpr_[r])
         {
+            bool wasMultretTail = regIsMultretTail_[r];
             out.push_back(regValue(r));
+            if (wasMultretTail)
+                break; // nothing meaningful follows a multret expansion's tail
             ++r;
         }
     }

@@ -152,6 +152,7 @@ private:
 
     std::vector<ExprPtr> regExpr_;      // pending symbolic values per register
     std::vector<bool> regIsAtom_;       // true if regExpr_[r] is safe to re-read without consuming
+    std::vector<bool> regIsMultretTail_;
     std::vector<std::optional<std::string>> declaredName_; // name last declared (via `local`) for reg r, if any
     std::vector<StmtPtr> stmts_;
     int freshCounter_ = 0;

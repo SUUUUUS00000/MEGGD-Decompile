@@ -138,7 +138,7 @@ std::set<uint8_t> collectWrittenRegs(const Proto& proto, int lo, int hi)
         const Instruction& insn = proto.instructions[i];
         if (writesRegisterA(insn.op))
             out.insert(insn.a);
-        else if (insn.op == Op::CALL && insn.c >= 2)
+        else if ((insn.op == Op::CALL || insn.op == Op::CALLFB) && insn.c >= 2)
         {
             uint32_t n = insn.c - 1;
             for (uint32_t k = 0; k < n; ++k)
@@ -211,6 +211,7 @@ std::vector<uint8_t> readsRegisters(const Instruction& insn)
         return r;
     }
     case Op::CALL:
+    case Op::CALLFB:
     {
         std::vector<uint8_t> r{insn.a};
         if (insn.b >= 2)
@@ -290,7 +291,7 @@ public:
             const Instruction& insn = proto_.instructions[i];
             if (writesRegisterA(insn.op) && insn.a < n)
                 defsPerReg[insn.a].push_back(i);
-            else if (insn.op == Op::CALL && insn.c >= 2)
+            else if ((insn.op == Op::CALL || insn.op == Op::CALLFB) && insn.c >= 2)
             {
                 uint32_t cnt = insn.c - 1;
                 for (uint32_t k = 0; k < cnt; ++k)
@@ -334,6 +335,17 @@ public:
                     if (r < n)
                         readsPerReg[r].push_back(i);
                 }
+                // The loop-variable register specifically also gets a
+                // fresh "def" right here: FORNLOOP (the more obvious
+                // candidate for "this is where the loop variable's
+                // identity begins") physically sits *after* the entire
+                // body in program order, so relying on it alone would
+                // leave the body's reads still grouped into the *pre-loop*
+                // value's segment. FORNPREP, which directly precedes the
+                // body, is what actually needs to split them.
+                uint8_t varReg = static_cast<uint8_t>(insn.a + 2);
+                if (varReg < n)
+                    defsPerReg[varReg].push_back(i);
             }
             else if (insn.op == Op::FORNLOOP)
             {
@@ -347,7 +359,31 @@ public:
                 {
                     uint8_t r = static_cast<uint8_t>(insn.a + off);
                     if (r < n)
+                    {
                         readsPerReg[r].push_back(i);
+                        defsPerReg[r].push_back(i);
+                    }
+                }
+                // Look ahead to the matching FORGLOOP (FORGPREP jumps
+                // directly to it) to find how many user variables there
+                // are, and mark them as defined here too -- same
+                // reasoning as above: FORGLOOP itself sits after the
+                // whole body in program order, so it can't be the thing
+                // that separates the body's reads from whatever
+                // unrelated value happened to occupy these registers
+                // before the loop.
+                if (insn.jumpTarget >= 0 && insn.jumpTarget < static_cast<int32_t>(proto_.instructions.size()) &&
+                    proto_.instructions[insn.jumpTarget].op == Op::FORGLOOP)
+                {
+                    uint32_t nvars = auxA(proto_.instructions[insn.jumpTarget].aux);
+                    if (nvars == 0)
+                        nvars = 1;
+                    for (uint32_t off = 0; off < nvars; ++off)
+                    {
+                        uint8_t r = static_cast<uint8_t>(insn.a + 3 + off);
+                        if (r < n)
+                            defsPerReg[r].push_back(i);
+                    }
                 }
             }
             else if (insn.op == Op::FORGLOOP)
@@ -382,6 +418,10 @@ public:
                 uint32_t toPc = (segEnd < static_cast<int>(proto_.instructions.size())) ? proto_.instructions[segEnd].pc : proto_.totalWordCount;
                 std::string name = tracker_.localNameAt(r, fromPc).value_or(tracker_.freshSyntheticName());
                 tracker_.registerSyntheticLocalRange(r, fromPc, toPc, name);
+#ifdef LUAUDEC_DEBUG_PREPASS
+                fprintf(stderr, "[prepass] reg=%d name=%s fromPc=%u toPc=%u (defIdx=%d segEnd=%d readCount=%d)\n",
+                        (int)r, name.c_str(), fromPc, toPc, defIdx, segEnd, readCount);
+#endif
             }
         }
     }

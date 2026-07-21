@@ -118,8 +118,6 @@ public:
     // debug info to tell us its real name).
     void pinAsVariable(uint8_t r, uint32_t fromPc, uint32_t toPc, const std::string& name);
 
-    void registerSyntheticLocalRange(uint8_t r, uint32_t fromPc, uint32_t toPc, const std::string& name);
-
     // True if register r currently holds a pending *compound* value (one
     // that regValue() would consume/clear on read) rather than a freely
     // re-readable atom or nothing at all. The structurizer uses this to
@@ -140,6 +138,15 @@ public:
     // generate one for pinAsVariable when no debug name is available).
     std::string freshSyntheticName();
 
+    // Pre-registers a synthetic local name for register r over
+    // [fromPc, toPc), *without* touching its current value or emitting
+    // anything (unlike pinAsVariable, which does both immediately). Used
+    // by the structurizer's whole-function pre-pass: once structuring's
+    // linear walk actually reaches the instruction that writes r within
+    // this range, produceValue will discover the registration via
+    // activeLocalName and materialize it normally at that point.
+    void registerSyntheticLocalRange(uint8_t r, uint32_t fromPc, uint32_t toPc, const std::string& name);
+
     // Explicitly drops any pending value for register r. Used by the
     // structurizer after a loop construct is fully processed to clear its
     // internal control registers (limit/step, generator/state/control),
@@ -154,7 +161,7 @@ private:
 
     std::vector<ExprPtr> regExpr_;      // pending symbolic values per register
     std::vector<bool> regIsAtom_;       // true if regExpr_[r] is safe to re-read without consuming
-    std::vector<bool> regIsMultretTail_;
+    std::vector<bool> regIsMultretTail_; // true if regExpr_[r] came from a multret-producing CALL/GETVARARGS
     std::vector<std::optional<std::string>> declaredName_; // name last declared (via `local`) for reg r, if any
     std::vector<StmtPtr> stmts_;
     int freshCounter_ = 0;

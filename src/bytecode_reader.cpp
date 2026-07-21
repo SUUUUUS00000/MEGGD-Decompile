@@ -2,6 +2,7 @@
 #include "bytecode_reader.hpp"
 
 #include <cstring>
+#include <cstdio>
 #include <fstream>
 #include <sstream>
 
@@ -102,13 +103,13 @@ std::optional<uint32_t> BytecodeReader::readStringRef(const Module& /*module*/)
 // Top-level module
 // ---------------------------------------------------------------------
 
-Module BytecodeReader::read(const uint8_t* data, size_t size)
+Module BytecodeReader::read(const uint8_t* data, size_t size, bool diagnostic)
 {
-    BytecodeReader reader(data, size);
+    BytecodeReader reader(data, size, diagnostic);
     return reader.parseModule();
 }
 
-Module BytecodeReader::readFile(const std::string& path)
+Module BytecodeReader::readFile(const std::string& path, bool diagnostic)
 {
     std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file)
@@ -123,7 +124,7 @@ Module BytecodeReader::readFile(const std::string& path)
     if (fsize > 0 && !file.read(reinterpret_cast<char*>(buf.data()), fsize))
         throw BytecodeReadError("failed reading file: " + path);
 
-    return read(buf.data(), buf.size());
+    return read(buf.data(), buf.size(), diagnostic);
 }
 
 Module BytecodeReader::parseModule()
@@ -171,8 +172,16 @@ Module BytecodeReader::parseModule()
     if (typesVersion == 3)
         parseUserdataTypeRemap(module);
 
+    if (diagnostic_)
+    {
+        fprintf(stderr, "[diag] header: version=%d typesVersion=%d stringCount=%u userdataTypeCount=%zu byteOffset=%zu\n",
+                int(module.version), int(module.typesVersion), stringCount, module.userdataTypes.size(), offset_);
+    }
+
     // Function protos.
     uint32_t protoCount = readVarInt();
+    if (diagnostic_)
+        fprintf(stderr, "[diag] protoCount=%u byteOffset=%zu\n", protoCount, offset_);
     module.protos.reserve(protoCount);
     for (uint32_t i = 0; i < protoCount; ++i)
     {
@@ -247,11 +256,21 @@ Proto BytecodeReader::parseProto(uint32_t index, Module& module)
     }
 
     uint32_t sizecode = readVarInt();
+    if (diagnostic_)
+    {
+        fprintf(stderr,
+                "[diag] proto %u: maxStack=%d numParams=%d numUpvalues=%d vararg=%d flags=%d typeSize=%u "
+                "sizecode=%u byteOffset=%zu (about to decode instructions)\n",
+                index, int(proto.maxStackSize), int(proto.numParams), int(proto.numUpvalues), int(proto.isVararg), int(proto.flags),
+                static_cast<uint32_t>(proto.typeInfoRaw.size()), sizecode, offset_);
+    }
     std::vector<uint32_t> words(sizecode);
     for (uint32_t i = 0; i < sizecode; ++i)
         words[i] = readU32();
     proto.totalWordCount = sizecode;
     decodeInstructions(proto, words);
+    if (diagnostic_)
+        fprintf(stderr, "[diag] proto %u: instructions decoded OK (%zu logical instructions), byteOffset=%zu\n", index, proto.instructions.size(), offset_);
 
     uint32_t sizek = readVarInt();
     proto.constants.reserve(sizek);
@@ -262,6 +281,9 @@ Proto BytecodeReader::parseProto(uint32_t index, Module& module)
     proto.childProtoIds.reserve(sizep);
     for (uint32_t i = 0; i < sizep; ++i)
         proto.childProtoIds.push_back(readVarInt());
+
+    if (diagnostic_)
+        fprintf(stderr, "[diag] proto %u: sizek=%u sizep=%u byteOffset=%zu\n", index, sizek, sizep, offset_);
 
     proto.lineDefined = static_cast<int32_t>(readVarInt());
     proto.debugNameString = readStringRef(module);

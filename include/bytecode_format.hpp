@@ -234,8 +234,6 @@ constexpr std::array<OpInfo, kOpCount> kOpTable = {{
     {"CMPPROTO", Mode::AD, true},
 }};
 
-inline const OpInfo& opInfo(uint8_t op);
-
 inline const OpInfo& opInfo(uint8_t op)
 {
     static const OpInfo unknown{"UNKNOWN", Mode::ABC, false};
@@ -257,20 +255,8 @@ inline uint8_t insnOp(uint32_t insn) { return static_cast<uint8_t>(insn & 0xff);
 inline uint8_t insnA(uint32_t insn) { return static_cast<uint8_t>((insn >> 8) & 0xff); }
 inline uint8_t insnB(uint32_t insn) { return static_cast<uint8_t>((insn >> 16) & 0xff); }
 inline uint8_t insnC(uint32_t insn) { return static_cast<uint8_t>((insn >> 24) & 0xff); }
-
-// Portable, standard-compliant sign extension for 16-bit D and 24-bit E fields.
-inline int32_t insnD(uint32_t insn) 
-{ 
-    return static_cast<int16_t>(insn >> 16); 
-}
-
-inline int32_t insnE(uint32_t insn) 
-{ 
-    uint32_t v = (insn >> 8) & 0xffffff;
-    if (v & 0x800000) 
-        v |= 0xff000000;
-    return static_cast<int32_t>(v); 
-}
+inline int32_t insnD(uint32_t insn) { return static_cast<int32_t>(insn) >> 16; }
+inline int32_t insnE(uint32_t insn) { return static_cast<int32_t>(insn) >> 8; }
 
 inline uint8_t auxA(uint32_t aux) { return static_cast<uint8_t>(aux & 0xff); }
 inline uint8_t auxB(uint32_t aux) { return static_cast<uint8_t>((aux >> 8) & 0xff); }

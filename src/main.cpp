@@ -12,9 +12,12 @@ namespace
 {
 void printUsage(const char* prog)
 {
-    std::cerr << "usage: " << prog << " [--asm|--decompile] <bytecode.bin> [-o output.lua]\n"
+    std::cerr << "usage: " << prog << " [--asm|--decompile] <bytecode.bin> [-o output.lua] [--diag]\n"
               << "  --decompile   emit reconstructed Luau-like source (default)\n"
-              << "  --asm         emit a disassembly listing instead\n";
+              << "  --asm         emit a disassembly listing instead\n"
+              << "  --diag        print structural parse progress to stderr (sizes/counts only,\n"
+              << "                never string/constant content) -- useful for reporting a parse\n"
+              << "                failure without needing to share the file itself\n";
 }
 } // namespace
 
@@ -29,12 +32,15 @@ int main(int argc, char** argv)
     std::string mode = "--decompile";
     std::string inputPath;
     std::string outputPath;
+    bool diagnostic = false;
 
     for (int i = 1; i < argc; ++i)
     {
         std::string arg = argv[i];
         if (arg == "--asm" || arg == "--decompile")
             mode = arg;
+        else if (arg == "--diag")
+            diagnostic = true;
         else if (arg == "-o" && i + 1 < argc)
             outputPath = argv[++i];
         else if (inputPath.empty())
@@ -55,7 +61,7 @@ int main(int argc, char** argv)
     Module module;
     try
     {
-        module = BytecodeReader::readFile(inputPath);
+        module = BytecodeReader::readFile(inputPath, diagnostic);
     }
     catch (const BytecodeReadError& e)
     {

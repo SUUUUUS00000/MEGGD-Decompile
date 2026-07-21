@@ -27,14 +27,18 @@ class BytecodeReader
 public:
     // Parses `size` bytes at `data`. Throws BytecodeReadError on any
     // malformed or truncated input, or on a bytecode/type version outside
-    // the supported range.
-    static Module read(const uint8_t* data, size_t size);
+    // the supported range. If `diagnostic` is set, prints structural
+    // (non-content: sizes/counts, never string or constant text) progress
+    // to stderr as parsing proceeds, so partial progress is visible even
+    // if parsing later throws -- useful for narrowing down where a parse
+    // failure originates without needing to share the actual file.
+    static Module read(const uint8_t* data, size_t size, bool diagnostic = false);
 
     // Convenience: reads an entire file from disk and parses it.
-    static Module readFile(const std::string& path);
+    static Module readFile(const std::string& path, bool diagnostic = false);
 
 private:
-    BytecodeReader(const uint8_t* data, size_t size) : data_(data), size_(size) {}
+    BytecodeReader(const uint8_t* data, size_t size, bool diagnostic = false) : data_(data), size_(size), diagnostic_(diagnostic) {}
 
     Module parseModule();
     void parseUserdataTypeRemap(Module& module);
@@ -60,6 +64,7 @@ private:
     const uint8_t* data_;
     size_t size_;
     size_t offset_ = 0;
+    bool diagnostic_ = false;
 };
 
 } // namespace luaudec

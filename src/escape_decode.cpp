@@ -104,14 +104,17 @@ bool decodeSpan(const std::string& text, size_t begin, size_t end, std::vector<u
 
 std::optional<std::vector<uint8_t>> tryDecodeLuaEscapedBytes(const std::string& text)
 {
-    std::vector<uint8_t> best;
-    bool found = false;
+    // Find every quoted string literal in the text, decode each
+    // individually, and remember its [start, end) span (end = index right
+    // after the closing quote) so adjacent ones can be checked for `..`
+    // concatenation afterwards.
+    struct Span
+    {
+        size_t begin, end; // of the literal incl. quotes
+        std::vector<uint8_t> bytes;
+    };
+    std::vector<Span> spans;
 
-    // Shape 1: one or more quoted string literals somewhere in the text
-    // (e.g. `return "\7\0\3..."`, `local b = "..."`). Try every one found
-    // and keep the largest successfully-decoded result -- the bytecode
-    // payload is virtually always the largest string literal in a small
-    // wrapper file, as opposed to a short label or comment string.
     for (size_t i = 0; i < text.size(); ++i)
     {
         char q = text[i];
@@ -143,32 +146,74 @@ std::optional<std::vector<uint8_t>> tryDecodeLuaEscapedBytes(const std::string& 
         if (j < text.size() && text[j] == q)
         {
             std::vector<uint8_t> candidate;
-            if (decodeSpan(text, i + 1, j, candidate) && candidate.size() > best.size())
-            {
-                best = std::move(candidate);
-                found = true;
-            }
+            if (decodeSpan(text, i + 1, j, candidate) && !candidate.empty())
+                spans.push_back(Span{i, j + 1, std::move(candidate)});
+            i = j; // resume scanning right after this literal
         }
-        // Whether or not this one worked out, resume scanning right after
-        // it (or from i+1 if unterminated) for any other literal.
     }
-    if (found)
-        return best;
 
-    // Shape 2: no quotes anywhere, but the file still has backslash
-    // escapes -- maybe it's a bare dump of the escaped content with no
-    // surrounding Lua syntax at all.
-    if (text.find('"') == std::string::npos && text.find('\'') == std::string::npos && text.find('\\') != std::string::npos)
+    if (spans.empty())
     {
-        size_t end = text.size();
-        while (end > 0 && std::isspace(static_cast<unsigned char>(text[end - 1])))
-            --end;
-        std::vector<uint8_t> candidate;
-        if (decodeSpan(text, 0, end, candidate) && !candidate.empty())
-            return candidate;
+        // Shape 2: no quotes anywhere, but the file still has backslash
+        // escapes -- maybe it's a bare dump of the escaped content with
+        // no surrounding Lua syntax at all.
+        if (text.find('"') == std::string::npos && text.find('\'') == std::string::npos && text.find('\\') != std::string::npos)
+        {
+            size_t end = text.size();
+            while (end > 0 && std::isspace(static_cast<unsigned char>(text[end - 1])))
+                --end;
+            std::vector<uint8_t> candidate;
+            if (decodeSpan(text, 0, end, candidate) && !candidate.empty())
+                return candidate;
+        }
+        return std::nullopt;
     }
 
-    return std::nullopt;
+    // Merge consecutive spans that are joined by `..` (only whitespace and
+    // exactly one `..` token allowed in the gap between them) -- a large
+    // bytecode dump is very commonly split across several literals this
+    // way, e.g. `"\1\2..." ..\n"\3\4..."`.
+    std::vector<uint8_t> best = spans[0].bytes;
+    std::vector<uint8_t> chain = spans[0].bytes;
+    for (size_t k = 1; k < spans.size(); ++k)
+    {
+#ifdef LUAUDEC_DEBUG_ESCAPE
+        fprintf(stderr, "[escdbg] span %zu: begin=%zu end=%zu bytes=%zu\n", k - 1, spans[k - 1].begin, spans[k - 1].end, spans[k - 1].bytes.size());
+#endif
+        size_t gapBegin = spans[k - 1].end;
+        size_t gapEnd = spans[k].begin;
+        size_t p = gapBegin;
+        while (p < gapEnd && std::isspace(static_cast<unsigned char>(text[p])))
+            ++p;
+        bool hasConcat = (p + 1 < gapEnd && text[p] == '.' && text[p + 1] == '.');
+        if (hasConcat)
+        {
+            p += 2;
+            while (p < gapEnd && std::isspace(static_cast<unsigned char>(text[p])))
+                ++p;
+        }
+        bool onlyWhitespaceAndOptionalConcat = (p == gapEnd);
+#ifdef LUAUDEC_DEBUG_ESCAPE
+        fprintf(stderr, "[escdbg] gap [%zu,%zu) text=%s hasConcat=%d p=%zu gapEnd=%zu merge=%d\n", gapBegin, gapEnd,
+                text.substr(gapBegin, gapEnd - gapBegin).c_str(), hasConcat, p, gapEnd,
+                onlyWhitespaceAndOptionalConcat && (hasConcat || gapBegin == gapEnd));
+#endif
+
+        if (onlyWhitespaceAndOptionalConcat && (hasConcat || gapBegin == gapEnd))
+        {
+            chain.insert(chain.end(), spans[k].bytes.begin(), spans[k].bytes.end());
+        }
+        else
+        {
+            chain = spans[k].bytes; // gap breaks the chain; restart from here
+        }
+        if (chain.size() > best.size())
+            best = chain;
+        if (spans[k].bytes.size() > best.size())
+            best = spans[k].bytes;
+    }
+
+    return best;
 }
 
 } // namespace luaudec

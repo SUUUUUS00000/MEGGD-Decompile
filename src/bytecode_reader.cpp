@@ -3,6 +3,7 @@
 
 #include <cstring>
 #include <cstdio>
+#include <cctype>
 #include <fstream>
 #include <sstream>
 
@@ -161,11 +162,25 @@ Module BytecodeReader::parseModule()
 
     // String table.
     uint32_t stringCount = readVarInt();
+    if (diagnostic_)
+        fprintf(stderr, "[diag] stringCount=%u byteOffset=%zu\n", stringCount, offset_);
     module.strings.reserve(stringCount);
     for (uint32_t i = 0; i < stringCount; ++i)
     {
+        size_t beforeLen = offset_;
         uint32_t len = readVarInt();
+        size_t beforeData = offset_;
         module.strings.push_back(readRawString(len));
+        if (diagnostic_)
+        {
+            const std::string& s = module.strings.back();
+            std::string preview;
+            preview.reserve(std::min<size_t>(s.size(), 24));
+            for (size_t k = 0; k < s.size() && k < 24; ++k)
+                preview += std::isprint(static_cast<unsigned char>(s[k])) ? s[k] : '.';
+            fprintf(stderr, "[diag] string[%u]: lenFieldOffset=%zu dataOffset=%zu len=%u preview=\"%s%s\"\n", i, beforeLen, beforeData,
+                    len, preview.c_str(), s.size() > 24 ? "..." : "");
+        }
     }
 
     // Userdata type remap table (only present for typesVersion == 3).

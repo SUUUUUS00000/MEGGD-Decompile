@@ -1,5 +1,8 @@
 #include "bytecode_format.hpp"
 
+#include <array>
+#include <string_view>
+
 namespace luaudec
 {
 

@@ -2,6 +2,7 @@
 #include "expr_tracker.hpp"
 
 #include <algorithm>
+#include <cctype>
 
 namespace luaudec
 {

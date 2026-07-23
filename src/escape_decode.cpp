@@ -38,7 +38,10 @@ bool decodeSpan(const std::string& text, size_t begin, size_t end, std::vector<u
 
         ++i; // consume backslash
         if (i >= end)
-            return false; // trailing backslash, nothing after it
+        {
+            out.push_back('\\'); // trailing backslash, nothing after it -- keep it literally
+            break;
+        }
         char e = text[i];
 
         switch (e)
@@ -62,14 +65,20 @@ bool decodeSpan(const std::string& text, size_t begin, size_t end, std::vector<u
             break;
         case 'x':
         {
-            if (i + 2 >= end)
-                return false;
-            int h1 = hexVal(text[i + 1]);
-            int h2 = hexVal(text[i + 2]);
-            if (h1 < 0 || h2 < 0)
-                return false;
-            out.push_back(static_cast<uint8_t>(h1 * 16 + h2));
-            i += 3;
+            int h1 = (i + 1 < end) ? hexVal(text[i + 1]) : -1;
+            int h2 = (i + 2 < end) ? hexVal(text[i + 2]) : -1;
+            if (h1 >= 0 && h2 >= 0)
+            {
+                out.push_back(static_cast<uint8_t>(h1 * 16 + h2));
+                i += 3;
+            }
+            else
+            {
+                // Malformed \x -- keep going rather than rejecting the
+                // whole span over it.
+                out.push_back('x');
+                ++i;
+            }
             break;
         }
         case 'z':
@@ -77,6 +86,54 @@ bool decodeSpan(const std::string& text, size_t begin, size_t end, std::vector<u
             while (i < end && std::isspace(static_cast<unsigned char>(text[i])))
                 ++i;
             break;
+        case 'u':
+        {
+            // \u{XXX}: Lua 5.4/Luau Unicode escape, encoded as UTF-8.
+            if (i + 1 < end && text[i + 1] == '{')
+            {
+                size_t k = i + 2;
+                uint32_t cp = 0;
+                bool any = false;
+                while (k < end && hexVal(text[k]) >= 0)
+                {
+                    cp = cp * 16 + static_cast<uint32_t>(hexVal(text[k]));
+                    ++k;
+                    any = true;
+                }
+                if (any && k < end && text[k] == '}')
+                {
+                    if (cp < 0x80)
+                    {
+                        out.push_back(static_cast<uint8_t>(cp));
+                    }
+                    else if (cp < 0x800)
+                    {
+                        out.push_back(static_cast<uint8_t>(0xC0 | (cp >> 6)));
+                        out.push_back(static_cast<uint8_t>(0x80 | (cp & 0x3F)));
+                    }
+                    else if (cp < 0x10000)
+                    {
+                        out.push_back(static_cast<uint8_t>(0xE0 | (cp >> 12)));
+                        out.push_back(static_cast<uint8_t>(0x80 | ((cp >> 6) & 0x3F)));
+                        out.push_back(static_cast<uint8_t>(0x80 | (cp & 0x3F)));
+                    }
+                    else
+                    {
+                        out.push_back(static_cast<uint8_t>(0xF0 | (cp >> 18)));
+                        out.push_back(static_cast<uint8_t>(0x80 | ((cp >> 12) & 0x3F)));
+                        out.push_back(static_cast<uint8_t>(0x80 | ((cp >> 6) & 0x3F)));
+                        out.push_back(static_cast<uint8_t>(0x80 | (cp & 0x3F)));
+                    }
+                    i = k + 1;
+                    break;
+                }
+            }
+            // Malformed \u -- fall through to lenient handling below rather
+            // than rejecting the whole (possibly otherwise-fine) span.
+            out.push_back('u');
+            ++i;
+            break;
+        }
         default:
             if (e >= '0' && e <= '9')
             {
@@ -88,12 +145,18 @@ bool decodeSpan(const std::string& text, size_t begin, size_t end, std::vector<u
                     ++n;
                 }
                 if (val > 255)
-                    return false;
+                    val &= 0xff; // be lenient rather than rejecting the whole span
                 out.push_back(static_cast<uint8_t>(val));
             }
             else
             {
-                return false; // unrecognized escape
+                // Unrecognized escape: rather than rejecting the entire
+                // (possibly large, otherwise-correct) literal over one odd
+                // sequence, degrade gracefully -- drop the backslash and
+                // keep the character literally, same as Lua does for a
+                // handful of its own "escape is just the character" cases.
+                out.push_back(static_cast<uint8_t>(e));
+                ++i;
             }
         }
     }

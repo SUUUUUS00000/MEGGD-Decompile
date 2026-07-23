@@ -6,6 +6,7 @@
 #include <cctype>
 #include <fstream>
 #include <sstream>
+#include <algorithm>
 
 namespace luaudec
 {
@@ -377,7 +378,7 @@ void BytecodeReader::decodeInstructions(Proto& proto, const std::vector<uint32_t
             insn.hasAux = true;
         }
 
-        size_t insnIndex = proto.instructions.size();
+        size_size_t insnIndex = proto.instructions.size();
         proto.pcToInsnIndex[pc] = static_cast<int32_t>(insnIndex);
         proto.instructions.push_back(insn);
 

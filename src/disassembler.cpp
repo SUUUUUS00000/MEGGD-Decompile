@@ -385,10 +385,10 @@ std::string Disassembler::formatInstruction(const Module& module, const Proto& p
     }
 
     case Op::NEWCLASSMEMBER:
-        out << " " << reg(insn.a) << " " << reg(insn.b) << " " << K(auxKV(insn.aux));
+        out << " " << reg(insn.a) << " " << reg(insn.c) << " " << K(auxKV(insn.aux));
         break;
     case Op::CALLFB:
-        out << " " << reg(insn.a) << " " << reg(insn.b) << " " << K(auxKV(insn.aux));
+        out << " " << reg(insn.a) << " nargs=" << countField(insn.b) << " nres=" << countField(insn.c) << " feedbackSlot=" << insn.aux;
         break;
 
     default:
